@@ -1,0 +1,10 @@
+[package]
+name = "civilcad_native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+acadrust = "=0.6.6"
+jni = "0.21"
