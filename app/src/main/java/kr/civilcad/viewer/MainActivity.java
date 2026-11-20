@@ -160,6 +160,9 @@ public class MainActivity extends Activity {
   @Override protected void onDestroy(){worker.shutdownNow();super.onDestroy();}
 
   final class Viewer extends View {
+    static final class Batch { final float[] coords=new float[4096];int count; }
+    final HashMap<Integer,Batch> batches=new HashMap<>();
+    boolean moving=false;
     Dxf.Drawing drawing;
     int mode=PAN;HashSet<String> hidden=new HashSet<>();
     Dxf.Polygon selected;
@@ -211,27 +214,66 @@ public class MainActivity extends Activity {
         canvas.drawText("도면 열기를 눌러주세요.",dp(24),getHeight()/2f,textPaint);
         return;
       }
-      linePaint.setStyle(Paint.Style.STROKE);linePaint.setStrokeWidth(dp(1));
-      String lastLayer=null;int color=Color.WHITE;
-      for(Dxf.Line line:drawing.lines){
-        if(hidden.contains(line.layer))continue;
-        if(!line.layer.equals(lastLayer)){lastLayer=line.layer;color=layerColor(line.layer);}
-        linePaint.setColor(color);
-        canvas.drawLine(sx(line.x1),sy(line.y1),sx(line.x2),sy(line.y2),linePaint);
+
+      linePaint.setStyle(Paint.Style.STROKE);
+      linePaint.setStrokeWidth(dp(1));
+      // Query spatial tiles intersecting the display. Avoid one Canvas call per segment.
+      double[] near=world(-16,getHeight()+16),far=world(getWidth()+16,-16);
+      Dxf.IntBag visible=drawing.index==null?null:drawing.index.query(
+        Math.min(near[0],far[0]),Math.min(near[1],far[1]),
+        Math.max(near[0],far[0]),Math.max(near[1],far[1]));
+      if(visible!=null) {
+        for(Batch batch:batches.values())batch.count=0;
+        final int cap=moving?60000:180000;
+        final int stride=Math.max(1,(visible.size+cap-1)/cap);
+        for(int k=0;k<visible.size;k+=stride){
+          Dxf.Line line=drawing.lines.get(visible.values[k]);
+          if(hidden.contains(line.layer))continue;
+          float x1=sx(line.x1),y1=sy(line.y1),x2=sx(line.x2),y2=sy(line.y2);
+          float margin=dp(16);
+          if((x1 < -margin&&x2 < -margin)||(x1>getWidth()+margin&&x2>getWidth()+margin)
+              ||(y1 < -margin&&y2 < -margin)||(y1>getHeight()+margin&&y2>getHeight()+margin))continue;
+          if(Math.abs(x1-x2)<.35f&&Math.abs(y1-y2)<.35f)continue;
+          int color=layerColor(line.layer);
+          Batch batch=batches.get(color);
+          if(batch==null){batch=new Batch();batches.put(color,batch);}
+          if(batch.count==batch.coords.length){
+            linePaint.setColor(color);
+            canvas.drawLines(batch.coords,0,batch.count,linePaint);
+            batch.count=0;
+          }
+          batch.coords[batch.count++]=x1;
+          batch.coords[batch.count++]=y1;
+          batch.coords[batch.count++]=x2;
+          batch.coords[batch.count++]=y2;
+        }
+        for(Map.Entry<Integer,Batch> item:batches.entrySet()){
+          Batch batch=item.getValue();
+          if(batch.count>0){
+            linePaint.setColor(item.getKey());
+            canvas.drawLines(batch.coords,0,batch.count,linePaint);
+            batch.count=0;
+          }
+        }
       }
       textPaint.setStyle(Paint.Style.FILL);
       textPaint.setTypeface(Typeface.create("sans-serif",Typeface.NORMAL));
+      int displayedText=0;
       for(Dxf.Label item:drawing.texts){
         if(hidden.contains(item.layer))continue;
         float size=(float)(item.size*scale);
-        if(!Float.isFinite(size)||size<2||size>getHeight()*3)continue;
+        if(!Float.isFinite(size)||size<3||size>getHeight()*2)continue;
+        float x=sx(item.x),y=sy(item.y);
+        float margin=Math.min(getWidth(),size*Math.min(70,item.text.length()));
+        if(x < -margin||x>getWidth()+dp(16)||y < -size*3||y>getHeight()+size*3)continue;
+        if(++displayedText>2200)break; // Avoid text floods in a full drawing view.
         textPaint.setColor(layerColor(item.layer));
         textPaint.setTextSize(size);
-        float x=sx(item.x),y=sy(item.y);
-        canvas.save();canvas.rotate((float)-Math.toDegrees(item.angle),x,y);
-        String[] lines=item.text.split("\n",-1);
-        for(int i=0;i<Math.min(16,lines.length);i++){
-          if(!lines[i].isEmpty())canvas.drawText(lines[i],x,y+i*size*1.3f,textPaint);
+        canvas.save();
+        canvas.rotate((float)-Math.toDegrees(item.angle),x,y);
+        String[] textLines=item.text.split("\n",-1);
+        for(int i=0;i<Math.min(16,textLines.length);i++){
+          if(!textLines[i].isEmpty())canvas.drawText(textLines[i],x,y+i*size*1.3f,textPaint);
         }
         canvas.restore();
       }
@@ -272,7 +314,7 @@ public class MainActivity extends Activity {
       zoom.onTouchEvent(e);
       switch(e.getActionMasked()){
         case MotionEvent.ACTION_DOWN:
-          downX=lastX=e.getX();downY=lastY=e.getY();moved=false;multiTouch=false;return true;
+          moving=true;downX=lastX=e.getX();downY=lastY=e.getY();moved=false;multiTouch=false;return true;
         case MotionEvent.ACTION_POINTER_DOWN:
           moved=true;multiTouch=true;return true;
         case MotionEvent.ACTION_POINTER_UP:
@@ -284,8 +326,11 @@ public class MainActivity extends Activity {
           }
           lastX=e.getX();lastY=e.getY();return true;
         case MotionEvent.ACTION_UP:
+          moving=false;
           if(mode!=PAN&&drawing!=null&&!moved&&!multiTouch)pick(e.getX(),e.getY());
-          return true;
+          invalidate();return true;
+        case MotionEvent.ACTION_CANCEL:
+          moving=false;invalidate();return true;
       }
       return true;
     }
