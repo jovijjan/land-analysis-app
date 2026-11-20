@@ -338,24 +338,25 @@ final class Dxf {
             }else if(active.type.equals("VERTEX")&&modelPolyline!=null){
               vertices.add(new double[]{active.num(10,0),active.num(20,0),active.num(42,0),active.num(30,0)});
             }else if(active.type.equals("SEQEND")&&modelPolyline!=null){
-              if((modelPolyline.integer(70,0)&8)!=0){
-                int count=vertices.size(),max=(modelPolyline.integer(70,0)&1)!=0?count:count-1;
-                for(int i=0;i<max;i++){
-                  double[] a=vertices.get(i),b=vertices.get((i+1)%count);
-                  d.line3d(a[0],a[1],a[3],b[0],b[1],b[3],modelPolyline.layer());
+              int flag=modelPolyline.integer(70,0);
+              if((flag&8)!=0){
+                int count=vertices.size(),edges=(flag&1)!=0?count:count-1;
+                for(int i=0;i<edges;i++){
+                  double[] p=vertices.get(i),q=vertices.get((i+1)%count);
+                  d.line3d(p[0],p[1],p[3],q[0],q[1],q[3],modelPolyline.layer());
                 }
-                modelPolyline=null;vertices.clear();
-                active=null;continue;
+              }else{
+                Entity poly=new Entity("LWPOLYLINE");
+                for(double[] point:vertices){
+                  poly.vals.add(new Pair(10,Double.toString(point[0])));
+                  poly.vals.add(new Pair(20,Double.toString(point[1])));
+                  if(point[2]!=0)poly.vals.add(new Pair(42,Double.toString(point[2])));
+                }
+                poly.vals.add(new Pair(8,modelPolyline.layer()));
+                poly.vals.add(new Pair(70,Integer.toString(flag&1)));
+                poly.vals.add(new Pair(38,Double.toString(modelPolyline.num(30,0))));
+                flatten(d,Collections.singletonList(poly),blocks,identity,"0",0,emptyStack);
               }
-              Entity poly=new Entity("LWPOLYLINE");
-              for(double[] point:vertices){
-                poly.vals.add(new Pair(10,Double.toString(point[0])));
-                poly.vals.add(new Pair(20,Double.toString(point[1])));
-                if(point[2]!=0)poly.vals.add(new Pair(42,Double.toString(point[2])));
-              }
-              poly.vals.add(new Pair(8,modelPolyline.layer()));
-              poly.vals.add(new Pair(70,Integer.toString(modelPolyline.integer(70,0)&1)));
-              flatten(d,Collections.singletonList(poly),blocks,identity,"0",0,emptyStack);
               modelPolyline=null;vertices.clear();
             }else if(!active.type.equals("VERTEX")){
               flatten(d,Collections.singletonList(active),blocks,identity,"0",0,emptyStack);
@@ -471,10 +472,11 @@ final class Dxf {
             double[] xy=transform.point(e.num(xi,0),e.num(yi,0));
             pts[j][0]=xy[0];pts[j][1]=xy[1];pts[j][2]=transform.elevation(e.num(zi,0));
           }
-          for(int j=0;j<4;j++){
-            if(j==3&&pts[3][0]==pts[2][0]&&pts[3][1]==pts[2][1]&&pts[3][2]==pts[2][2])break;
-            double[] a=pts[j],b=pts[(j+1)%4];
-            d.line3d(a[0],a[1],a[2],b[0],b[1],b[2],l);
+          boolean triangle=pts[3][0]==pts[2][0]&&pts[3][1]==pts[2][1]&&pts[3][2]==pts[2][2];
+          int vertices=triangle?3:4;
+          for(int j=0;j<vertices;j++){
+            double[] first=pts[j],second=pts[(j+1)%vertices];
+            d.line3d(first[0],first[1],first[2],second[0],second[1],second[2],l);
           }
           break;
         }
