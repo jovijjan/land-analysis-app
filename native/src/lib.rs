@@ -31,7 +31,7 @@ fn convert_file(from: &str, to: &str) -> Result<(), String> {
     let mut header = [0; 6];
     {
         use std::io::Read;
-        let mut head = file.try_clone().map_err(|e| e.to_string())?;
+        let mut head = File::open(from).map_err(|e| e.to_string())?;
         head.read_exact(&mut header).map_err(|e| e.to_string())?;
     }
     if !header.starts_with(b"AC10") {
