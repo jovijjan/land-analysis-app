@@ -148,6 +148,7 @@ final class Dxf {
     final double minX,minY,stepX,stepY;
     final int[] seen;
     int stamp;
+    final IntBag visibleScratch=new IntBag();
     SpatialIndex(Drawing drawing){
       minX=drawing.minX;minY=drawing.minY;
       stepX=Math.max(.0000001,(drawing.maxX-drawing.minX)/GRID);
@@ -168,7 +169,8 @@ final class Dxf {
     int cellX(double value){return Math.max(0,Math.min(GRID-1,(int)Math.floor((value-minX)/stepX)));}
     int cellY(double value){return Math.max(0,Math.min(GRID-1,(int)Math.floor((value-minY)/stepY)));}
     IntBag query(double x0,double y0,double x1,double y1){
-      IntBag result=new IntBag();
+      IntBag result=visibleScratch;
+      result.size=0;
       if(stamp==Integer.MAX_VALUE){Arrays.fill(seen,0);stamp=0;}
       int tag=++stamp;
       int left=cellX(Math.min(x0,x1)),right=cellX(Math.max(x0,x1));
@@ -250,7 +252,7 @@ final class Dxf {
     String value=out.toString().replace("\\P","\n").replace("\\~"," ")
       .replace("%%d","°").replace("%%D","°").replace("%%p","±").replace("%%P","±")
       .replace("%%c","Ø").replace("%%C","Ø");
-    value=value.replaceAll("\\\\[CcFfHhWwTtQqAa][^;]*;","");
+    value=MTEXT_STYLE.matcher(value).replaceAll("");
     return value.replace("\\L","").replace("\\l","").replace("\\O","").replace("\\o","")
       .replace("{","").replace("}","");
   }
@@ -297,6 +299,8 @@ final class Dxf {
     Entity active=null,modelPolyline=null;
     Block currentBlock=null;
     ArrayList<double[]> vertices=new ArrayList<>();
+    final Transform identity=Transform.identity();
+    final HashSet<String> emptyStack=new HashSet<>();
     int groups=0;
     Pair pair;
     while((pair=next(reader))!=null){
@@ -324,10 +328,10 @@ final class Dxf {
               }
               poly.vals.add(new Pair(8,modelPolyline.layer()));
               poly.vals.add(new Pair(70,Integer.toString(modelPolyline.integer(70,0)&1)));
-              flatten(d,Collections.singletonList(poly),blocks,Transform.identity(),"0",0,new HashSet<String>());
+              flatten(d,Collections.singletonList(poly),blocks,identity,"0",0,emptyStack);
               modelPolyline=null;vertices.clear();
             }else if(!active.type.equals("VERTEX")){
-              flatten(d,Collections.singletonList(active),blocks,Transform.identity(),"0",0,new HashSet<String>());
+              flatten(d,Collections.singletonList(active),blocks,identity,"0",0,emptyStack);
             }
           }
           active=null;
@@ -348,7 +352,7 @@ final class Dxf {
       }
     }
     if(active!=null&&section.equals("ENTITIES"))
-      flatten(d,Collections.singletonList(active),blocks,Transform.identity(),"0",0,new HashSet<String>());
+      flatten(d,Collections.singletonList(active),blocks,identity,"0",0,emptyStack);
     if(d.lines.isEmpty()&&d.texts.isEmpty())throw new IOException("표시 가능한 선 또는 문자가 없습니다.");
     d.prepareIndex();
     return d;
