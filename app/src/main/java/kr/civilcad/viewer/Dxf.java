@@ -16,8 +16,11 @@ final class Dxf {
   static final Pattern MTEXT_STYLE = Pattern.compile("\\\\[CcFfHhWwTtQqAa][^;]*;");
 
   static final class Line {
-    final double x1,y1,x2,y2; final String layer;
-    Line(double a,double b,double c,double d,String l) {x1=a;y1=b;x2=c;y2=d;layer=l;}
+    final double x1,y1,z1,x2,y2,z2; final String layer;
+    Line(double a,double b,double c,double d,String l){this(a,b,0,c,d,0,l);}
+    Line(double a,double b,double az,double c,double d,double bz,String l){
+      x1=a;y1=b;z1=az;x2=c;y2=d;z2=bz;layer=l;
+    }
   }
   static final class Label {
     final double x,y,size,angle; final String text,layer;
@@ -69,16 +72,22 @@ final class Dxf {
     void prepareIndex(){index=new SpatialIndex(this);}
     double minX=Double.POSITIVE_INFINITY,minY=Double.POSITIVE_INFINITY,
            maxX=Double.NEGATIVE_INFINITY,maxY=Double.NEGATIVE_INFINITY;
+    double minZ=Double.POSITIVE_INFINITY,maxZ=Double.NEGATIVE_INFINITY;
     int unit=0; int unitOverride=-1; int inserts=0, unsupported=0;
     void bounds(double x,double y) {
       if(!Double.isFinite(x)||!Double.isFinite(y))return;
       minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);
     }
     void line(double x1,double y1,double x2,double y2,String layer) {
-      if(!Double.isFinite(x1)||!Double.isFinite(y1)||!Double.isFinite(x2)||!Double.isFinite(y2))return;
+      line3d(x1,y1,0,x2,y2,0,layer);
+    }
+    void line3d(double x1,double y1,double z1,double x2,double y2,double z2,String layer) {
+      if(!Double.isFinite(x1)||!Double.isFinite(y1)||!Double.isFinite(z1)
+        ||!Double.isFinite(x2)||!Double.isFinite(y2)||!Double.isFinite(z2))return;
       if(lines.size()>=MAX_LINES)throw new IllegalArgumentException("선 요소가 너무 많습니다.");
-      lines.add(new Line(x1,y1,x2,y2,layer));layers.add(layer);
+      lines.add(new Line(x1,y1,z1,x2,y2,z2,layer));layers.add(layer);
       bounds(x1,y1);bounds(x2,y2);
+      minZ=Math.min(minZ,Math.min(z1,z2));maxZ=Math.max(maxZ,Math.max(z1,z2));
     }
     void label(double x,double y,double h,double a,String text,String layer) {
       if(text==null||text.isEmpty()||!Double.isFinite(x)||!Double.isFinite(y)||!Double.isFinite(h)||h<=0)return;
@@ -217,16 +226,20 @@ final class Dxf {
     Block(Entity h){name=h.str(2,h.str(3,""));baseX=h.num(10,0);baseY=h.num(20,0);}
   }
   static final class Transform {
-    final double a,b,c,d,x,y;
+    final double a,b,c,d,x,y,z,sz;
     Transform(double a,double b,double c,double d,double x,double y){
-      this.a=a;this.b=b;this.c=c;this.d=d;this.x=x;this.y=y;
+      this(a,b,c,d,x,y,0,1);
+    }
+    Transform(double a,double b,double c,double d,double x,double y,double z,double sz){
+      this.a=a;this.b=b;this.c=c;this.d=d;this.x=x;this.y=y;this.z=z;this.sz=sz;
     }
     static Transform identity(){return new Transform(1,0,0,1,0,0);}
     double[] point(double px,double py){return new double[]{a*px+c*py+x,b*px+d*py+y};}
+    double elevation(double local){return z+sz*local;}
     Transform compose(Transform local){
       return new Transform(a*local.a+c*local.b,b*local.a+d*local.b,
         a*local.c+c*local.d,b*local.c+d*local.d,
-        a*local.x+c*local.y+x,b*local.x+d*local.y+y);
+        a*local.x+c*local.y+x,b*local.x+d*local.y+y,elevation(local.z),sz*local.sz);
     }
   }
   static Pair next(BufferedReader in)throws IOException {
@@ -291,7 +304,8 @@ final class Dxf {
       case 1: case 2: case 3: case 8: case 10: case 11:
       case 20: case 21: case 40: case 41: case 42:
       case 44: case 45: case 50: case 51: case 70:
-      case 71: case 72: case 73: case 90:return true;
+      case 71: case 72: case 73: case 90:
+      case 30: case 31: case 32: case 33: case 38: case 39:return true;
       default:return false;
     }
   }
@@ -322,8 +336,17 @@ final class Dxf {
             if(active.type.equals("POLYLINE")){
               modelPolyline=active;vertices.clear();
             }else if(active.type.equals("VERTEX")&&modelPolyline!=null){
-              vertices.add(new double[]{active.num(10,0),active.num(20,0),active.num(42,0)});
+              vertices.add(new double[]{active.num(10,0),active.num(20,0),active.num(42,0),active.num(30,0)});
             }else if(active.type.equals("SEQEND")&&modelPolyline!=null){
+              if((modelPolyline.integer(70,0)&8)!=0){
+                int count=vertices.size(),max=(modelPolyline.integer(70,0)&1)!=0?count:count-1;
+                for(int i=0;i<max;i++){
+                  double[] a=vertices.get(i),b=vertices.get((i+1)%count);
+                  d.line3d(a[0],a[1],a[3],b[0],b[1],b[3],modelPolyline.layer());
+                }
+                modelPolyline=null;vertices.clear();
+                active=null;continue;
+              }
               Entity poly=new Entity("LWPOLYLINE");
               for(double[] point:vertices){
                 poly.vals.add(new Pair(10,Double.toString(point[0])));
@@ -377,11 +400,19 @@ final class Dxf {
         int j=i+1;
         while(j<entries.size()&&entries.get(j).type.equals("VERTEX")){
           Entity v=entries.get(j);
-          pts.add(new double[]{v.num(10,0),v.num(20,0),v.num(42,0)});
+          pts.add(new double[]{v.num(10,0),v.num(20,0),v.num(42,0),v.num(30,0)});
           j++;
         }
         if(j<entries.size()&&entries.get(j).type.equals("SEQEND"))j++;
-        appendPoly(d,pts,l,(flags&1)!=0,transform);
+        if((flags&8)!=0){
+          int n=pts.size(),edges=(flags&1)!=0?n:n-1;
+          for(int z=0;z<edges;z++){
+            double[] p=pts.get(z),q=pts.get((z+1)%n);
+            double[] a=transform.point(p[0],p[1]),b=transform.point(q[0],q[1]);
+            d.line3d(a[0],a[1],transform.elevation(p[3]),
+                b[0],b[1],transform.elevation(q[3]),l);
+          }
+        }else appendPoly(d,pts,l,(flags&1)!=0,transform);
         i=j-1;continue;
       }
       if(e.type.equals("INSERT")){
@@ -398,7 +429,8 @@ final class Dxf {
         HashSet<String> nextStack=new HashSet<>(stack);nextStack.add(name);
         for(int r=0;r<rows;r++)for(int col=0;col<cols;col++){
           double dx=e.num(44,0)*col-block.baseX,dy=e.num(45,0)*r-block.baseY;
-          Transform t=new Transform(a,b,c,f,e.num(10,0)+a*dx+c*dy,e.num(20,0)+b*dx+f*dy);
+          Transform t=new Transform(a,b,c,f,e.num(10,0)+a*dx+c*dy,
+            e.num(20,0)+b*dx+f*dy,e.num(30,0),e.num(43,1));
           flatten(d,block.entries,blocks,transform.compose(t),l,depth+1,nextStack);
         }
         continue;
@@ -407,7 +439,8 @@ final class Dxf {
         case "LINE":{
           double[] p1=transform.point(e.num(10,0),e.num(20,0)),
                    p2=transform.point(e.num(11,0),e.num(21,0));
-          d.line(p1[0],p1[1],p2[0],p2[1],l);break;
+          d.line3d(p1[0],p1[1],transform.elevation(e.num(30,0)),
+              p2[0],p2[1],transform.elevation(e.num(31,0)),l);break;
         }
         case "LWPOLYLINE":{
           ArrayList<double[]> pts=new ArrayList<>();
@@ -418,7 +451,7 @@ final class Dxf {
               else if(g.key==42&&!pts.isEmpty())pts.get(pts.size()-1)[2]=Double.parseDouble(g.value);
             }catch(Exception ignored){}
           }
-          appendPoly(d,pts,l,(e.integer(70,0)&1)!=0,transform);break;
+          appendPoly(d,pts,l,(e.integer(70,0)&1)!=0,transform,e.num(38,0));break;
         }
         case "CIRCLE": case "ARC":{
           double start=0,end=360;
@@ -428,7 +461,21 @@ final class Dxf {
             if(end-start>360)end=start+360;
           }
           appendArc(d,e.num(10,0),e.num(20,0),e.num(40,0),
-                     start,end,l,transform,e.type.equals("CIRCLE"));
+                     start,end,l,transform,e.type.equals("CIRCLE"),e.num(30,0));
+          break;
+        }
+        case "3DFACE": {
+          double[][] pts=new double[4][3];
+          for(int j=0;j<4;j++){
+            int xi=10+j, yi=20+j, zi=30+j;
+            double[] xy=transform.point(e.num(xi,0),e.num(yi,0));
+            pts[j][0]=xy[0];pts[j][1]=xy[1];pts[j][2]=transform.elevation(e.num(zi,0));
+          }
+          for(int j=0;j<4;j++){
+            if(j==3&&pts[3][0]==pts[2][0]&&pts[3][1]==pts[2][1]&&pts[3][2]==pts[2][2])break;
+            double[] a=pts[j],b=pts[(j+1)%4];
+            d.line3d(a[0],a[1],a[2],b[0],b[1],b[2],l);
+          }
           break;
         }
         case "TEXT": case "MTEXT": case "ATTRIB": case "ATTDEF":{
@@ -457,7 +504,7 @@ final class Dxf {
     }
   }
   static void appendArc(Drawing d,double cx,double cy,double r,double start,double end,
-                        String layer,Transform t,boolean closed){
+                        String layer,Transform t,boolean closed,double elevation){
     if(!Double.isFinite(r)||r<=0||r>1e10)return;
     int count=Math.max(24,Math.min(360,(int)Math.ceil(Math.abs(end-start)/3.0)));
     ArrayList<double[]> pts=new ArrayList<>();
@@ -466,11 +513,15 @@ final class Dxf {
       pts.add(t.point(cx+r*Math.cos(a),cy+r*Math.sin(a)));
     }
     for(int i=1;i<pts.size();i++){
-      double[] p=pts.get(i-1),q=pts.get(i);d.line(p[0],p[1],q[0],q[1],layer);
+      double[] p=pts.get(i-1),q=pts.get(i);
+      d.line3d(p[0],p[1],t.elevation(elevation),q[0],q[1],t.elevation(elevation),layer);
     }
     if(closed){pts.remove(pts.size()-1);d.polygon(pts,layer);}
   }
   static void appendPoly(Drawing d,List<double[]> points,String layer,boolean closed,Transform t){
+    appendPoly(d,points,layer,closed,t,0);
+  }
+  static void appendPoly(Drawing d,List<double[]> points,String layer,boolean closed,Transform t,double elevation){
     if(points.size()<2)return;
     ArrayList<double[]> sampled=new ArrayList<>();
     int n=closed?points.size():points.size()-1;
@@ -480,7 +531,7 @@ final class Dxf {
       double bulge=p.length>2?p[2]:0;
       if(Math.abs(bulge)<1e-9) {
         double[] to=t.point(q[0],q[1]),from=sampled.get(sampled.size()-1);
-        d.line(from[0],from[1],to[0],to[1],layer);sampled.add(to);
+        d.line3d(from[0],from[1],t.elevation(elevation),to[0],to[1],t.elevation(elevation),layer);sampled.add(to);
       }else{
         double dx=q[0]-p[0],dy=q[1]-p[1],ch=Math.hypot(dx,dy);
         if(ch<1e-9)continue;
