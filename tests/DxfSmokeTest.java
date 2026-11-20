@@ -47,7 +47,7 @@ public class DxfSmokeTest {
       require(streamed.lines.size()==4&&streamed.polygons.size()==1,"file-backed parser");
       require(streamed.index!=null,"spatial index built");
       require(streamed.index.query(95,195,105,210).size==4,"visible block lines");
-      require(streamed.index.query(96,201,98,205).size>=1,"partial tile intersection");
+      require(streamed.index.query(99.98,201,100.01,205).size>=1,"partial tile intersection");
     } finally { temp.delete(); }
 
     System.out.println("DXF smoke test PASS - block insert, text, MTEXT, ATTRIB, closed polygon and area");
