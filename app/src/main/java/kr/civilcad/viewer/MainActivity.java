@@ -15,9 +15,13 @@ import java.util.concurrent.*;
 
 public class MainActivity extends Activity {
   static final int OPEN=101;
-  static final int PAN=0, DISTANCE=1, CLOSED_AREA=2, POINT_AREA=3;
+  static final int PAN=0, DISTANCE=1, POINT_AREA=3;
   TextView status; Viewer view;
-  Button measureButton, closedButton, pointButton;
+  Basic3DView view3d;
+  FrameLayout viewerHost;
+  LinearLayout toolBar;
+  Button measureButton, pointButton, switchViewButton;
+  boolean threeD=false;
   String drawingName="";
   final ExecutorService worker=Executors.newSingleThreadExecutor();
   final Handler handler=new Handler(Looper.getMainLooper());
@@ -58,21 +62,26 @@ public class MainActivity extends Activity {
     root.setBackgroundColor(Color.rgb(14,21,31));
     LinearLayout fileBar=new LinearLayout(this);
     Button open=button("📁 도면 열기"),layers=button("레이어"),units=button("단위");
-    addButton(fileBar,open);addButton(fileBar,layers);addButton(fileBar,units);
-    LinearLayout toolBar=new LinearLayout(this);
+    switchViewButton=button("3D 뷰");
+    addButton(fileBar,open);addButton(fileBar,layers);addButton(fileBar,units);addButton(fileBar,switchViewButton);
+    toolBar=new LinearLayout(this);
     measureButton=button("📏 거리");
-    closedButton=button("폐합 면적");
     pointButton=button("점 면적");
     Button done=button("완료 / 취소");
-    addButton(toolBar,measureButton);addButton(toolBar,closedButton);
+    addButton(toolBar,measureButton);
     addButton(toolBar,pointButton);addButton(toolBar,done);
     status=new TextView(this);
     status.setTextColor(Color.WHITE);
     status.setTextSize(13);status.setPadding(dp(12),dp(8),dp(12),dp(8));
     status.setText("DWG 또는 DXF 도면을 열어주세요.");
     view=new Viewer(this);
+    view3d=new Basic3DView(this);
+    viewerHost=new FrameLayout(this);
+    viewerHost.addView(view,new FrameLayout.LayoutParams(-1,-1));
+    viewerHost.addView(view3d,new FrameLayout.LayoutParams(-1,-1));
+    view3d.setVisibility(View.GONE);
     root.addView(fileBar);root.addView(toolBar);root.addView(status);
-    root.addView(view,new LinearLayout.LayoutParams(-1,0,1));
+    root.addView(viewerHost,new LinearLayout.LayoutParams(-1,0,1));
     setContentView(root);
 
     open.setOnClickListener(v->{
@@ -81,8 +90,8 @@ public class MainActivity extends Activity {
       startActivityForResult(it,OPEN);
     });
     measureButton.setOnClickListener(v->setMode(DISTANCE));
-    closedButton.setOnClickListener(v->setMode(CLOSED_AREA));
     pointButton.setOnClickListener(v->setMode(POINT_AREA));
+    switchViewButton.setOnClickListener(v->toggleView());
     done.setOnClickListener(v->{
       if(view.mode==POINT_AREA&&view.areaPoints.size()>=3){
         double area=Dxf.Polygon.area(view.areaPoints);
@@ -98,10 +107,26 @@ public class MainActivity extends Activity {
     });
     layers.setOnClickListener(v->layerDialog());
     units.setOnClickListener(v->unitDialog());
+    handleOpenIntent(getIntent());
+  }
+  void toggleView(){
+    if(view.drawing==null){status.setText("도면을 먼저 열어주세요.");return;}
+    threeD=!threeD;
+    view.mode=PAN;view.first=null;view.second=null;view.areaPoints.clear();view.areaFinished=false;
+    view.setVisibility(threeD?View.GONE:View.VISIBLE);
+    view3d.setVisibility(threeD?View.VISIBLE:View.GONE);
+    toolBar.setVisibility(threeD?View.GONE:View.VISIBLE);
+    switchViewButton.setText(threeD?"2D 뷰":"3D 뷰");
+    if(threeD){
+      view3d.setDrawing(view.drawing,view.hidden);
+      status.setText((view.drawing.maxZ>view.drawing.minZ+1e-8)
+        ?"3D 와이어프레임 · 손가락 회전 / 두 손가락 확대"
+        :"3D 와이어프레임 · 이 도면에는 Z 높이 차이가 없습니다.");
+    }else status.setText("2D 모드 · 확대/이동/거리/점면적");
+    updateToolText();
   }
   void updateToolText(){
     measureButton.setText(view.mode==DISTANCE?"✓ 거리":"📏 거리");
-    closedButton.setText(view.mode==CLOSED_AREA?"✓ 폐합 면적":"폐합 면적");
     pointButton.setText(view.mode==POINT_AREA?"✓ 점 면적":"점 면적");
   }
   void setMode(int newMode) {
@@ -111,7 +136,6 @@ public class MainActivity extends Activity {
     view.selected=null;view.areaPoints.clear();view.areaFinished=false;
     switch(view.mode){
       case DISTANCE:status.setText("두 점을 선택하세요. 선 끝점에 자동 스냅됩니다.");break;
-      case CLOSED_AREA:status.setText("폐합 폴리라인 내부 또는 경계선을 누르세요.");break;
       case POINT_AREA:status.setText("면적 경계점을 차례로 누른 다음 [완료]를 누르세요.");break;
       default:status.setText("한 손가락 이동 · 두 손가락 확대/축소");
     }
@@ -122,13 +146,26 @@ public class MainActivity extends Activity {
     String[] names=view.drawing.layers.toArray(new String[0]);
     boolean[] selected=new boolean[names.length];
     for(int i=0;i<names.length;i++)selected[i]=!view.hidden.contains(names[i]);
-    new AlertDialog.Builder(this).setTitle("레이어 켜기·끄기")
-      .setMultiChoiceItems(names,selected,(dialog,index,on)->selected[index]=on)
-      .setPositiveButton("적용",(dialog,which)->{
-        view.hidden.clear();
-        for(int i=0;i<names.length;i++)if(!selected[i])view.hidden.add(names[i]);
+    AlertDialog dialog=new AlertDialog.Builder(this).setTitle("레이어 표시 (실시간)")
+      .setMultiChoiceItems(names,selected,(d,index,checked)->{
+        if(checked)view.hidden.remove(names[index]);
+        else view.hidden.add(names[index]);
         view.invalidate();
-      }).setNegativeButton("취소",null).show();
+        view3d.invalidate();
+      })
+      .setPositiveButton("닫기",(d,w)->{}).create();
+    dialog.setOnShowListener(x->{
+      Window window=dialog.getWindow();
+      if(window!=null){
+        android.util.DisplayMetrics metrics=getResources().getDisplayMetrics();
+        window.setLayout((int)(metrics.widthPixels*.88f),(int)(metrics.heightPixels*.50f));
+        window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+        WindowManager.LayoutParams attrs=window.getAttributes();
+        attrs.dimAmount=.10f;
+        window.setAttributes(attrs);
+      }
+    });
+    dialog.show();
   }
   void unitDialog() {
     if(view.drawing==null){status.setText("도면을 먼저 열어주세요.");return;}
@@ -145,7 +182,23 @@ public class MainActivity extends Activity {
   @Override protected void onActivityResult(int req,int result,Intent data){
     super.onActivityResult(req,result,data);
     if(req!=OPEN||result!=RESULT_OK||data==null)return;
-    Uri uri=data.getData();if(uri==null)return;
+    openUri(data.getData());
+  }
+  @Override protected void onNewIntent(Intent intent){
+    super.onNewIntent(intent);
+    setIntent(intent);
+    handleOpenIntent(intent);
+  }
+  void handleOpenIntent(Intent intent){
+    if(intent==null)return;
+    String action=intent.getAction();
+    Uri uri=null;
+    if(Intent.ACTION_VIEW.equals(action))uri=intent.getData();
+    else if(Intent.ACTION_SEND.equals(action))uri=intent.getParcelableExtra(Intent.EXTRA_STREAM);
+    if(uri!=null)openUri(uri);
+  }
+  void openUri(Uri uri){
+    if(uri==null)return;
     String fileName="drawing";
     try(Cursor c=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){
       if(c!=null&&c.moveToFirst())fileName=c.getString(0);
@@ -219,6 +272,12 @@ public class MainActivity extends Activity {
       Dxf.Drawing parsed=Dxf.parse(input);
       runOnUiThread(()->{
         view.setDrawing(parsed);
+        view3d.setDrawing(parsed,view.hidden);
+        if(threeD){
+          threeD=false;
+          view3d.setVisibility(View.GONE);view.setVisibility(View.VISIBLE);
+          toolBar.setVisibility(View.VISIBLE);switchViewButton.setText("3D 뷰");
+        }
         view.mode=PAN;updateToolText();
         status.setText(name+" · 선 "+parsed.lines.size()+" · 문자 "+parsed.texts.size()
             +" · 블록 "+parsed.inserts+" · 면적 "+parsed.polygons.size()
@@ -415,12 +474,6 @@ public class MainActivity extends Activity {
     void pick(float x,float y){
       double[] pos=world(x,y);
       double tolerance=dp(18)/Math.max(scale,1e-8);
-      if(mode==CLOSED_AREA){
-        selected=drawing.findPolygon(pos[0],pos[1],tolerance,hidden);
-        if(selected==null)status.setText("폐합 폴리라인이 없습니다. [점 면적]을 사용해 보세요.");
-        else status.setText("선택 면적: "+drawing.area(selected.area)+" · "+selected.layer+" · 평면 면적");
-        invalidate();return;
-      }
       pos=drawing.snap(pos[0],pos[1],tolerance,hidden);
       if(mode==DISTANCE){
         if(first==null||second!=null){first=pos;second=null;
