@@ -120,13 +120,17 @@ final class Dxf {
       return candidate;
     }
     double[] snap(double x,double y,double tolerance,Set<String> hidden){
-      double best=tolerance*tolerance;double[] found=null;
-      for(Line l:lines){
-        if(hidden.contains(l.layer))continue;
-        double dx=l.x1-x,dy=l.y1-y,r=dx*dx+dy*dy;
-        if(r<best){best=r;found=new double[]{l.x1,l.y1};}
-        dx=l.x2-x;dy=l.y2-y;r=dx*dx+dy*dy;
-        if(r<best){best=r;found=new double[]{l.x2,l.y2};}
+      double best=tolerance*tolerance;
+      double[] found=null;
+      IntBag candidates=index==null?null:index.query(x-tolerance,y-tolerance,x+tolerance,y+tolerance);
+      int size=candidates==null?lines.size():candidates.size;
+      for(int i=0;i<size;i++){
+        Line line=lines.get(candidates==null?i:candidates.values[i]);
+        if(hidden.contains(line.layer))continue;
+        double dx=line.x1-x,dy=line.y1-y,r=dx*dx+dy*dy;
+        if(r<best){best=r;found=new double[]{line.x1,line.y1};}
+        dx=line.x2-x;dy=line.y2-y;r=dx*dx+dy*dy;
+        if(r<best){best=r;found=new double[]{line.x2,line.y2};}
       }
       return found==null?new double[]{x,y}:found;
     }
