@@ -12,8 +12,8 @@ final class Dxf {
   static final int MAX_POLYGONS = 30000;
   static final int MAX_INSERTS = 80000;
   static final int MAX_RECURSION = 10;
-  static final Pattern UNICODE_ESCAPE = Pattern.compile("\\U\\+([0-9A-Fa-f]{4,8})");
-  static final Pattern MTEXT_STYLE = Pattern.compile("\\[CcFfHhWwTtQqAa][^;]*;");
+  static final Pattern UNICODE_ESCAPE = Pattern.compile("\\\\U\\+([0-9A-Fa-f]{4,8})");
+  static final Pattern MTEXT_STYLE = Pattern.compile("\\\\[CcFfHhWwTtQqAa][^;]*;");
 
   static final class Line {
     final double x1,y1,x2,y2; final String layer;
@@ -129,6 +129,56 @@ final class Dxf {
         if(r<best){best=r;found=new double[]{l.x2,l.y2};}
       }
       return found==null?new double[]{x,y}:found;
+    }
+  }
+
+  static final class IntBag {
+    int[] values=new int[16];
+    int size=0;
+    void add(int n){
+      if(size==values.length)values=Arrays.copyOf(values,values.length*2);
+      values[size++]=n;
+    }
+  }
+  // Spatial tiles avoid scanning the entire drawing for every pan/zoom frame.
+  static final class SpatialIndex {
+    static final int GRID=48;
+    final IntBag[] cells=new IntBag[GRID*GRID];
+    final IntBag longLines=new IntBag();
+    final double minX,minY,stepX,stepY;
+    final int[] seen;
+    int stamp;
+    SpatialIndex(Drawing drawing){
+      minX=drawing.minX;minY=drawing.minY;
+      stepX=Math.max(.0000001,(drawing.maxX-drawing.minX)/GRID);
+      stepY=Math.max(.0000001,(drawing.maxY-drawing.minY)/GRID);
+      seen=new int[drawing.lines.size()];
+      for(int i=0;i<drawing.lines.size();i++){
+        Line line=drawing.lines.get(i);
+        int x0=cellX(Math.min(line.x1,line.x2)),x1=cellX(Math.max(line.x1,line.x2));
+        int y0=cellY(Math.min(line.y1,line.y2)),y1=cellY(Math.max(line.y1,line.y2));
+        if((x1-x0+1)*(y1-y0+1)>32){longLines.add(i);continue;}
+        for(int y=y0;y<=y1;y++)for(int x=x0;x<=x1;x++){
+          int at=y*GRID+x;
+          if(cells[at]==null)cells[at]=new IntBag();
+          cells[at].add(i);
+        }
+      }
+    }
+    int cellX(double value){return Math.max(0,Math.min(GRID-1,(int)Math.floor((value-minX)/stepX)));}
+    int cellY(double value){return Math.max(0,Math.min(GRID-1,(int)Math.floor((value-minY)/stepY)));}
+    IntBag query(double x0,double y0,double x1,double y1){
+      IntBag result=new IntBag();
+      if(stamp==Integer.MAX_VALUE){Arrays.fill(seen,0);stamp=0;}
+      int tag=++stamp;
+      int left=cellX(Math.min(x0,x1)),right=cellX(Math.max(x0,x1));
+      int bottom=cellY(Math.min(y0,y1)),top=cellY(Math.max(y0,y1));
+      for(int y=bottom;y<=top;y++)for(int x=left;x<=right;x++){
+        IntBag cell=cells[y*GRID+x];if(cell==null)continue;
+        for(int i=0;i<cell.size;i++){int id=cell.values[i];if(seen[id]!=tag){seen[id]=tag;result.add(id);}}
+      }
+      for(int i=0;i<longLines.size;i++){int id=longLines.values[i];if(seen[id]!=tag){seen[id]=tag;result.add(id);}}
+      return result;
     }
   }
   static final class Pair {
