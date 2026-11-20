@@ -1,102 +1,394 @@
 package kr.civilcad.viewer;
-import java.io.*;import java.nio.charset.StandardCharsets;import java.util.*;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.charset.*;
+import java.util.*;
+import java.util.regex.*;
+
 final class Dxf {
-  static final class Line {final double x1,y1,x2,y2; final String layer;
-    Line(double a,double b,double c,double d,String l){x1=a;y1=b;x2=c;y2=d;layer=l;}}
-  static final class Drawing {
-    final ArrayList<Line> lines=new ArrayList<>();final TreeSet<String> layers=new TreeSet<>();
-    double minX=Double.POSITIVE_INFINITY,minY=Double.POSITIVE_INFINITY,maxX=Double.NEGATIVE_INFINITY,maxY=Double.NEGATIVE_INFINITY;int unit=0;
-    void add(double a,double b,double c,double d,String layer){
-      if(!Double.isFinite(a)||!Double.isFinite(b)||!Double.isFinite(c)||!Double.isFinite(d))return;
-      if(lines.size()>=500000)throw new IllegalArgumentException("선 개수 제한 초과");
-      lines.add(new Line(a,b,c,d,layer));layers.add(layer);
-      minX=Math.min(minX,Math.min(a,c));maxX=Math.max(maxX,Math.max(a,c));
-      minY=Math.min(minY,Math.min(b,d));maxY=Math.max(maxY,Math.max(b,d));
+  static final int MAX_LINES = 600000;
+  static final int MAX_TEXTS = 60000;
+  static final int MAX_POLYGONS = 30000;
+  static final int MAX_INSERTS = 80000;
+  static final int MAX_RECURSION = 10;
+
+  static final class Line {
+    final double x1,y1,x2,y2; final String layer;
+    Line(double a,double b,double c,double d,String l) {x1=a;y1=b;x2=c;y2=d;layer=l;}
+  }
+  static final class Label {
+    final double x,y,size,angle; final String text,layer;
+    Label(double a,double b,double h,double r,String v,String l){x=a;y=b;size=h;angle=r;text=v;layer=l;}
+  }
+  static final class Polygon {
+    final ArrayList<double[]> points; final String layer;
+    final double area;
+    Polygon(ArrayList<double[]> points,String layer) {
+      this.points=points; this.layer=layer; this.area=area(points);
     }
-    String units(){switch(unit){case 1:return "inch";case 2:return "ft";case 4:return "mm";case 5:return "cm";case 6:return "m";default:return "도면 단위";}}
+    static double area(List<double[]> points) {
+      int n=points.size(); if(n<3)return 0;
+      double x0=points.get(0)[0], y0=points.get(0)[1], twice=0;
+      for(int i=1;i<n-1;i++){
+        double[] a=points.get(i),b=points.get(i+1);
+        twice+=(a[0]-x0)*(b[1]-y0)-(b[0]-x0)*(a[1]-y0);
+      }
+      return Math.abs(twice)*.5;
+    }
+    boolean inside(double x,double y) {
+      boolean result=false;
+      int n=points.size();
+      for(int i=0,j=n-1;i<n;j=i++) {
+        double[] a=points.get(i), b=points.get(j);
+        if((a[1]>y)!=(b[1]>y) && x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0])result=!result;
+      }
+      return result;
+    }
+    boolean nearEdge(double x,double y,double worldTolerance) {
+      double sq=worldTolerance*worldTolerance;
+      for(int i=0,n=points.size();i<n;i++){
+        double[] a=points.get(i),b=points.get((i+1)%n);
+        double dx=b[0]-a[0],dy=b[1]-a[1];
+        double denom=dx*dx+dy*dy;
+        double t=denom<1e-12?0:Math.max(0,Math.min(1,((x-a[0])*dx+(y-a[1])*dy)/denom));
+        double ex=x-a[0]-t*dx,ey=y-a[1]-t*dy;
+        if(ex*ex+ey*ey<=sq)return true;
+      }
+      return false;
+    }
   }
-  static class Pair {final int key;final String value;Pair(int k,String v){key=k;value=v;}}
-  static class Entity {
-    final String name;final ArrayList<Pair> vals=new ArrayList<>();
-    Entity(String n){name=n;}
-    String str(int key,String def){for(Pair p:vals)if(p.key==key)return p.value;return def;}
-    double num(int key,double def){try{return Double.parseDouble(str(key,""));}catch(Exception e){return def;}}
-    int integer(int key,int def){try{return Integer.parseInt(str(key,""));}catch(Exception e){return def;}}
+  static final class Drawing {
+    final ArrayList<Line> lines=new ArrayList<>();
+    final ArrayList<Label> texts=new ArrayList<>();
+    final ArrayList<Polygon> polygons=new ArrayList<>();
+    final TreeSet<String> layers=new TreeSet<>();
+    double minX=Double.POSITIVE_INFINITY,minY=Double.POSITIVE_INFINITY,
+           maxX=Double.NEGATIVE_INFINITY,maxY=Double.NEGATIVE_INFINITY;
+    int unit=0; int unitOverride=-1; int inserts=0, unsupported=0;
+    void bounds(double x,double y) {
+      if(!Double.isFinite(x)||!Double.isFinite(y))return;
+      minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);
+    }
+    void line(double x1,double y1,double x2,double y2,String layer) {
+      if(!Double.isFinite(x1)||!Double.isFinite(y1)||!Double.isFinite(x2)||!Double.isFinite(y2))return;
+      if(lines.size()>=MAX_LINES)throw new IllegalArgumentException("선 요소가 너무 많습니다.");
+      lines.add(new Line(x1,y1,x2,y2,layer));layers.add(layer);
+      bounds(x1,y1);bounds(x2,y2);
+    }
+    void label(double x,double y,double h,double a,String text,String layer) {
+      if(text==null||text.isEmpty()||!Double.isFinite(x)||!Double.isFinite(y)||!Double.isFinite(h)||h<=0)return;
+      if(texts.size()>=MAX_TEXTS)throw new IllegalArgumentException("문자 요소가 너무 많습니다.");
+      texts.add(new Label(x,y,h,a,text,layer));layers.add(layer);
+      bounds(x,y); bounds(x+h*Math.min(80,text.length())*.65,y+h);
+    }
+    void polygon(ArrayList<double[]> points,String layer) {
+      if(points.size()<3||polygons.size()>=MAX_POLYGONS)return;
+      polygons.add(new Polygon(points,layer));
+    }
+    int chosenUnit(){return unitOverride<0?unit:unitOverride;}
+    double metresPerUnit(){
+      switch(chosenUnit()){case 1:return .0254;case 2:return .3048;case 4:return .001;case 5:return .01;
+        case 6:return 1;case 7:return 1000;case 10:return .9144;default:return Double.NaN;}
+    }
+    String units(){
+      switch(chosenUnit()){case 1:return "inch";case 2:return "ft";case 4:return "mm";case 5:return "cm";
+        case 6:return "m";case 7:return "km";case 10:return "yard";default:return "도면 단위";}
+    }
+    String distance(double value){
+      double factor=metresPerUnit();
+      return Double.isFinite(factor)?String.format(Locale.KOREA,"%.3f m",value*factor):
+        String.format(Locale.KOREA,"%.3f 도면단위",value);
+    }
+    String area(double value){
+      double factor=metresPerUnit();
+      return Double.isFinite(factor)?String.format(Locale.KOREA,"%.3f m²",value*factor*factor):
+        String.format(Locale.KOREA,"%.3f 도면단위²",value);
+    }
+    Polygon findPolygon(double x,double y,double tolerance,Set<String> hidden){
+      Polygon candidate=null;double best=Double.POSITIVE_INFINITY;
+      for(Polygon poly:polygons){
+        if(hidden.contains(poly.layer)||poly.area<=0)continue;
+        if((poly.inside(x,y)||poly.nearEdge(x,y,tolerance))&&poly.area<best){
+          best=poly.area;candidate=poly;
+        }
+      }
+      return candidate;
+    }
+    double[] snap(double x,double y,double tolerance,Set<String> hidden){
+      double best=tolerance*tolerance;double[] found=null;
+      for(Line l:lines){
+        if(hidden.contains(l.layer))continue;
+        double dx=l.x1-x,dy=l.y1-y,r=dx*dx+dy*dy;
+        if(r<best){best=r;found=new double[]{l.x1,l.y1};}
+        dx=l.x2-x;dy=l.y2-y;r=dx*dx+dy*dy;
+        if(r<best){best=r;found=new double[]{l.x2,l.y2};}
+      }
+      return found==null?new double[]{x,y}:found;
+    }
+  }
+  static final class Pair {
+    final int key;final String value;
+    Pair(int k,String v){key=k;value=v;}
+  }
+  static final class Entity {
+    final String type;final ArrayList<Pair> vals=new ArrayList<>();
+    Entity(String t){type=t;}
+    String str(int code,String fallback){
+      for(Pair p:vals)if(p.key==code)return p.value;
+      return fallback;
+    }
+    double num(int code,double fallback){
+      try{return Double.parseDouble(str(code,""));}catch(Exception e){return fallback;}
+    }
+    int integer(int code,int fallback){
+      try{return Integer.parseInt(str(code,""));}catch(Exception e){return fallback;}
+    }
     String layer(){return str(8,"0");}
+    String fullText(){
+      if(!type.equals("MTEXT"))return cleanText(str(1,""));
+      StringBuilder result=new StringBuilder();
+      for(Pair p:vals)if(p.key==3||p.key==1)result.append(p.value);
+      return cleanText(result.toString());
+    }
   }
-  static Pair next(BufferedReader in)throws IOException{
-    String code=in.readLine();String v=in.readLine();if(code==null||v==null)return null;
-    try{return new Pair(Integer.parseInt(code.trim()),v.trim());}catch(Exception e){return new Pair(-1,v);}
+  static final class Block {
+    final String name; final double baseX,baseY;final ArrayList<Entity> entries=new ArrayList<>();
+    Block(Entity h){name=h.str(2,h.str(3,""));baseX=h.num(10,0);baseY=h.num(20,0);}
+  }
+  static final class Transform {
+    final double a,b,c,d,x,y;
+    Transform(double a,double b,double c,double d,double x,double y){
+      this.a=a;this.b=b;this.c=c;this.d=d;this.x=x;this.y=y;
+    }
+    static Transform identity(){return new Transform(1,0,0,1,0,0);}
+    double[] point(double px,double py){return new double[]{a*px+c*py+x,b*px+d*py+y};}
+    Transform compose(Transform local){
+      return new Transform(a*local.a+c*local.b,b*local.a+d*local.b,
+        a*local.c+c*local.d,b*local.c+d*local.d,
+        a*local.x+c*local.y+x,b*local.x+d*local.y+y);
+    }
+  }
+  static Pair next(BufferedReader in)throws IOException {
+    String k=in.readLine(),v=in.readLine();if(k==null||v==null)return null;
+    try{return new Pair(Integer.parseInt(k.trim()),v.trim());}
+    catch(Exception e){throw new IOException("잘못된 DXF 그룹 코드");}
+  }
+  static Charset sourceCharset(byte[] bytes) {
+    try{
+      StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes));
+      return StandardCharsets.UTF_8;
+    }catch(Exception ignored){}
+    // Older Korean drawings commonly contain CP949 / ANSI_949 strings.
+    return Charset.forName("MS949");
+  }
+  static String cleanText(String raw) {
+    if(raw==null)return "";
+    Pattern escape=Pattern.compile("\\\\U\\+([0-9A-Fa-f]{4,8})");
+    Matcher matcher=escape.matcher(raw);
+    StringBuffer out=new StringBuffer();
+    while(matcher.find()){
+      String replacement="";
+      try{replacement=new String(Character.toChars(Integer.parseInt(matcher.group(1),16)));}
+      catch(Exception ignored){}
+      matcher.appendReplacement(out,Matcher.quoteReplacement(replacement));
+    }
+    matcher.appendTail(out);
+    String value=out.toString().replace("\\P","\n").replace("\\~"," ")
+      .replace("%%d","°").replace("%%D","°").replace("%%p","±").replace("%%P","±")
+      .replace("%%c","Ø").replace("%%C","Ø");
+    value=value.replaceAll("\\\\[CcFfHhWwTtQqAa][^;]*;","");
+    return value.replace("\\L","").replace("\\l","").replace("\\O","").replace("\\o","")
+      .replace("{","").replace("}","");
   }
   static Drawing parse(byte[] bytes)throws IOException {
-    Drawing out=new Drawing();if(bytes.length>192*1024*1024)throw new IOException("파일 용량 초과");
-    BufferedReader in=new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes),StandardCharsets.UTF_8),32768);
-    boolean sectionPending=false,ent=false,unitPending=false;
-    Entity item=null,poly=null;ArrayList<double[]> vertices=new ArrayList<>();
+    if(bytes.length>192*1024*1024)throw new IOException("변환된 도면이 너무 큽니다.");
+    Drawing d=new Drawing();
+    Map<String,Block> blocks=new HashMap<>();
+    ArrayList<Entity> model=new ArrayList<>();
+    BufferedReader reader=new BufferedReader(new InputStreamReader(
+      new ByteArrayInputStream(bytes),sourceCharset(bytes)),65536);
+    String section=""; boolean sectionPending=false, unitPending=false;
+    Entity active=null;Block currentBlock=null;int groups=0;
     Pair p;
-    while((p=next(in))!=null){
+    while((p=next(reader))!=null){
+      if(++groups>12000000)throw new IOException("DXF 요소가 너무 많습니다.");
       if(p.key==0){
-        if(item!=null) {
-          if(item.name.equals("VERTEX")&&poly!=null)vertices.add(new double[]{item.num(10,0),item.num(20,0),item.num(42,0)});
-          else if(item.name.equals("SEQEND")&&poly!=null){poly(out,vertices,poly.layer(),(poly.integer(70,0)&1)!=0);poly=null;vertices.clear();}
-          else if(item.name.equals("POLYLINE")){poly=item;vertices.clear();}
-          else if(!item.name.equals("VERTEX"))add(out,item);
+        if(active!=null){
+          if(section.equals("BLOCKS")&&active.type.equals("BLOCK"))currentBlock=new Block(active);
+          else if(section.equals("BLOCKS")&&active.type.equals("ENDBLK")) {
+            if(currentBlock!=null&&!currentBlock.name.isEmpty())
+              blocks.put(currentBlock.name.toUpperCase(Locale.ROOT),currentBlock);
+            currentBlock=null;
+          }else if(section.equals("BLOCKS")&&currentBlock!=null)currentBlock.entries.add(active);
+          else if(section.equals("ENTITIES"))model.add(active);
+          active=null;
         }
-        item=null;
-        if(p.value.equals("SECTION")){sectionPending=true;ent=false;}
-        else if(p.value.equals("ENDSEC"))ent=false;
-        else if(ent)item=new Entity(p.value);
+        switch(p.value){
+          case "SECTION":sectionPending=true;section="";break;
+          case "ENDSEC":section="";sectionPending=false;break;
+          case "EOF":section="";break;
+          default:
+            if(section.equals("ENTITIES")||section.equals("BLOCKS"))active=new Entity(p.value);
+        }
+      }else if(sectionPending&&p.key==2){section=p.value;sectionPending=false;}
+      else{
+        if(p.key==9)unitPending=p.value.equals("$INSUNITS");
+        else if(unitPending&&p.key==70){try{d.unit=Integer.parseInt(p.value);}catch(Exception ignored){}unitPending=false;}
+        if(active!=null)active.vals.add(p);
+      }
+    }
+    if(active!=null){
+      if(section.equals("ENTITIES"))model.add(active);
+      else if(section.equals("BLOCKS")&&currentBlock!=null)currentBlock.entries.add(active);
+    }
+    if(currentBlock!=null)blocks.put(currentBlock.name.toUpperCase(Locale.ROOT),currentBlock);
+    flatten(d,model,blocks,Transform.identity(),"0",0,new HashSet<String>());
+    if(d.lines.isEmpty()&&d.texts.isEmpty())throw new IOException("지원되는 도면 요소가 없습니다.");
+    return d;
+  }
+  static String layer(Entity e,String inherited){
+    String layer=e.layer();
+    return layer.equals("0")?inherited:layer;
+  }
+  static void flatten(Drawing d,List<Entity> entries,Map<String,Block> blocks,
+                       Transform transform,String inherited,int depth,Set<String> stack){
+    if(depth>MAX_RECURSION)return;
+    for(int i=0;i<entries.size();i++){
+      Entity e=entries.get(i);
+      String l=layer(e,inherited);
+      if(e.type.equals("POLYLINE")){
+        ArrayList<double[]> pts=new ArrayList<>();
+        int flags=e.integer(70,0);
+        int j=i+1;
+        while(j<entries.size()&&entries.get(j).type.equals("VERTEX")){
+          Entity v=entries.get(j);
+          pts.add(new double[]{v.num(10,0),v.num(20,0),v.num(42,0)});
+          j++;
+        }
+        if(j<entries.size()&&entries.get(j).type.equals("SEQEND"))j++;
+        appendPoly(d,pts,l,(flags&1)!=0,transform);
+        i=j-1;continue;
+      }
+      if(e.type.equals("INSERT")){
+        if(d.inserts++>MAX_INSERTS)throw new IllegalArgumentException("블록이 너무 많습니다.");
+        String name=e.str(2,"").toUpperCase(Locale.ROOT);
+        Block block=blocks.get(name);
+        if(block==null||stack.contains(name))continue;
+        double angle=Math.toRadians(e.num(50,0)),sin=Math.sin(angle),cos=Math.cos(angle);
+        double sx=e.num(41,1),sy=e.num(42,1);
+        if(!Double.isFinite(sx)||!Double.isFinite(sy)||sx==0||sy==0)continue;
+        int cols=Math.max(1,Math.min(100,e.integer(70,1)));
+        int rows=Math.max(1,Math.min(100,e.integer(71,1)));
+        double a=cos*sx,b=sin*sx,c=-sin*sy,f=cos*sy;
+        HashSet<String> nextStack=new HashSet<>(stack);nextStack.add(name);
+        for(int r=0;r<rows;r++)for(int col=0;col<cols;col++){
+          double dx=e.num(44,0)*col-block.baseX,dy=e.num(45,0)*r-block.baseY;
+          Transform t=new Transform(a,b,c,f,e.num(10,0)+a*dx+c*dy,e.num(20,0)+b*dx+f*dy);
+          flatten(d,block.entries,blocks,transform.compose(t),l,depth+1,nextStack);
+        }
         continue;
       }
-      if(sectionPending&&p.key==2){ent=p.value.equals("ENTITIES");sectionPending=false;continue;}
-      if(p.key==9)unitPending=p.value.equals("$INSUNITS");
-      else if(unitPending&&p.key==70){try{out.unit=Integer.parseInt(p.value);}catch(Exception ignored){}unitPending=false;}
-      if(item!=null)item.vals.add(p);
-    }
-    if(item!=null) add(out,item);
-    if(poly!=null)poly(out,vertices,poly.layer(),(poly.integer(70,0)&1)!=0);
-    if(out.lines.isEmpty())throw new IOException("표시 가능한 선 요소가 없습니다 (BLOCK/INSERT 미지원).");
-    return out;
-  }
-  static void add(Drawing d,Entity e){
-    String layer=e.layer();
-    switch(e.name){
-      case "LINE":d.add(e.num(10,0),e.num(20,0),e.num(11,0),e.num(21,0),layer);break;
-      case "CIRCLE":arc(d,e.num(10,0),e.num(20,0),e.num(40,0),0,360,layer);break;
-      case "ARC":double start=e.num(50,0),end=e.num(51,0);while(end<=start)end+=360;arc(d,e.num(10,0),e.num(20,0),e.num(40,0),start,end,layer);break;
-      case "LWPOLYLINE":
-        ArrayList<double[]> v=new ArrayList<>();
-        for(Pair p:e.vals){
-          try{if(p.key==10)v.add(new double[]{Double.parseDouble(p.value),0,0});
-          else if(p.key==20&&!v.isEmpty())v.get(v.size()-1)[1]=Double.parseDouble(p.value);
-          else if(p.key==42&&!v.isEmpty())v.get(v.size()-1)[2]=Double.parseDouble(p.value);}catch(Exception ignored){}
+      switch(e.type){
+        case "LINE":{
+          double[] p1=transform.point(e.num(10,0),e.num(20,0)),
+                   p2=transform.point(e.num(11,0),e.num(21,0));
+          d.line(p1[0],p1[1],p2[0],p2[1],l);break;
         }
-        poly(d,v,layer,(e.integer(70,0)&1)!=0);break;
-    }
-  }
-  static void poly(Drawing d,ArrayList<double[]> vertices,String l,boolean closed){
-    if(vertices.size()<2)return;int n=closed?vertices.size():vertices.size()-1;
-    for(int i=0;i<n;i++){
-      double[] a=vertices.get(i),b=vertices.get((i+1)%vertices.size());
-      double bulge=a[2];if(Math.abs(bulge)<1e-10){d.add(a[0],a[1],b[0],b[1],l);continue;}
-      double dx=b[0]-a[0],dy=b[1]-a[1],ch=Math.hypot(dx,dy);
-      if(ch<1e-9)continue;
-      double offset=ch*(1-bulge*bulge)/(4*bulge);
-      double cx=(a[0]+b[0])/2-dy/ch*offset,cy=(a[1]+b[1])/2+dx/ch*offset;
-      double r=Math.hypot(a[0]-cx,a[1]-cy),start=Math.atan2(a[1]-cy,a[0]-cx),angle=4*Math.atan(bulge);
-      double px=a[0],py=a[1];int count=Math.max(8,Math.min(100,(int)Math.ceil(Math.abs(angle)/.08)));
-      for(int k=1;k<=count;k++){
-        double t=start+k*angle/count;double x=cx+r*Math.cos(t),y=cy+r*Math.sin(t);
-        d.add(px,py,x,y,l);px=x;py=y;
+        case "LWPOLYLINE":{
+          ArrayList<double[]> pts=new ArrayList<>();
+          for(Pair g:e.vals){
+            try{
+              if(g.key==10)pts.add(new double[]{Double.parseDouble(g.value),0,0});
+              else if(g.key==20&&!pts.isEmpty())pts.get(pts.size()-1)[1]=Double.parseDouble(g.value);
+              else if(g.key==42&&!pts.isEmpty())pts.get(pts.size()-1)[2]=Double.parseDouble(g.value);
+            }catch(Exception ignored){}
+          }
+          appendPoly(d,pts,l,(e.integer(70,0)&1)!=0,transform);break;
+        }
+        case "CIRCLE": case "ARC":{
+          double start=0,end=360;
+          if(e.type.equals("ARC")){
+            start=e.num(50,0);end=e.num(51,0);
+            while(end<=start)end+=360;
+            if(end-start>360)end=start+360;
+          }
+          appendArc(d,e.num(10,0),e.num(20,0),e.num(40,0),
+                     start,end,l,transform,e.type.equals("CIRCLE"));
+          break;
+        }
+        case "TEXT": case "MTEXT": case "ATTRIB": case "ATTDEF":{
+          String value=e.fullText();
+          if(!value.isEmpty()){
+            boolean aligned=!e.type.equals("MTEXT")&&(e.integer(72,0)!=0||e.integer(73,0)!=0);
+            double x=e.num(aligned?11:10,e.num(10,0)),y=e.num(aligned?21:20,e.num(20,0));
+            double h=e.num(40,2.5);if(h<=0)h=2.5;
+            double rotation=e.num(50,0);
+            if(e.type.equals("MTEXT")&&e.str(11,"").length()>0){
+              rotation=Math.toDegrees(Math.atan2(e.num(21,0),e.num(11,1)));
+            }
+            double rad=Math.toRadians(rotation);
+            double[] p=transform.point(x,y);
+            double ux=transform.a*Math.cos(rad)+transform.c*Math.sin(rad),
+                   uy=transform.b*Math.cos(rad)+transform.d*Math.sin(rad);
+            double size=h*Math.hypot(ux,uy);
+            if(Double.isFinite(size)){
+              d.label(p[0],p[1],size,Math.atan2(uy,ux),value,l);
+            }
+          }break;
+        }
+        default:
+          if(!e.type.equals("SEQEND")&&!e.type.equals("VERTEX"))d.unsupported++;
       }
     }
   }
-  static void arc(Drawing d,double cx,double cy,double r,double start,double end,String l){
-    if(r<=0||r>1e9)return;int n=Math.max(18,Math.min(200,(int)Math.ceil((end-start)/5)));
-    double px=cx+r*Math.cos(Math.toRadians(start)),py=cy+r*Math.sin(Math.toRadians(start));
-    for(int i=1;i<=n;i++){
-      double t=Math.toRadians(start+(end-start)*i/n),x=cx+r*Math.cos(t),y=cy+r*Math.sin(t);
-      d.add(px,py,x,y,l);px=x;py=y;
+  static void appendArc(Drawing d,double cx,double cy,double r,double start,double end,
+                        String layer,Transform t,boolean closed){
+    if(!Double.isFinite(r)||r<=0||r>1e10)return;
+    int count=Math.max(24,Math.min(360,(int)Math.ceil(Math.abs(end-start)/3.0)));
+    ArrayList<double[]> pts=new ArrayList<>();
+    for(int i=0;i<=count;i++){
+      double a=Math.toRadians(start+(end-start)*i/count);
+      pts.add(t.point(cx+r*Math.cos(a),cy+r*Math.sin(a)));
+    }
+    for(int i=1;i<pts.size();i++){
+      double[] p=pts.get(i-1),q=pts.get(i);d.line(p[0],p[1],q[0],q[1],layer);
+    }
+    if(closed){pts.remove(pts.size()-1);d.polygon(pts,layer);}
+  }
+  static void appendPoly(Drawing d,List<double[]> points,String layer,boolean closed,Transform t){
+    if(points.size()<2)return;
+    ArrayList<double[]> sampled=new ArrayList<>();
+    int n=closed?points.size():points.size()-1;
+    for(int i=0;i<n;i++){
+      double[] p=points.get(i),q=points.get((i+1)%points.size());
+      if(sampled.isEmpty())sampled.add(t.point(p[0],p[1]));
+      double bulge=p.length>2?p[2]:0;
+      if(Math.abs(bulge)<1e-9) {
+        double[] to=t.point(q[0],q[1]),from=sampled.get(sampled.size()-1);
+        d.line(from[0],from[1],to[0],to[1],layer);sampled.add(to);
+      }else{
+        double dx=q[0]-p[0],dy=q[1]-p[1],ch=Math.hypot(dx,dy);
+        if(ch<1e-9)continue;
+        double offset=ch*(1-bulge*bulge)/(4*bulge);
+        double cx=(p[0]+q[0])/2-dy/ch*offset,cy=(p[1]+q[1])/2+dx/ch*offset;
+        double radius=Math.hypot(p[0]-cx,p[1]-cy);
+        double start=Math.atan2(p[1]-cy,p[0]-cx),sweep=4*Math.atan(bulge);
+        int count=Math.max(8,Math.min(180,(int)Math.ceil(Math.abs(sweep)/Math.toRadians(3))));
+        for(int step=1;step<=count;step++){
+          double a=start+sweep*step/count;
+          double[] to=t.point(cx+radius*Math.cos(a),cy+radius*Math.sin(a));
+          double[] from=sampled.get(sampled.size()-1);
+          d.line(from[0],from[1],to[0],to[1],layer);sampled.add(to);
+        }
+      }
+    }
+    if(closed){
+      if(sampled.size()>1) {
+        double[] a=sampled.get(0),b=sampled.get(sampled.size()-1);
+        if(Math.hypot(a[0]-b[0],a[1]-b[1])<1e-6)sampled.remove(sampled.size()-1);
+      }
+      d.polygon(sampled,layer);
     }
   }
 }
