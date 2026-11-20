@@ -12,6 +12,8 @@ final class Dxf {
   static final int MAX_POLYGONS = 30000;
   static final int MAX_INSERTS = 80000;
   static final int MAX_RECURSION = 10;
+  static final Pattern UNICODE_ESCAPE = Pattern.compile("\\U\\+([0-9A-Fa-f]{4,8})");
+  static final Pattern MTEXT_STYLE = Pattern.compile("\\[CcFfHhWwTtQqAa][^;]*;");
 
   static final class Line {
     final double x1,y1,x2,y2; final String layer;
@@ -63,6 +65,8 @@ final class Dxf {
     final ArrayList<Label> texts=new ArrayList<>();
     final ArrayList<Polygon> polygons=new ArrayList<>();
     final TreeSet<String> layers=new TreeSet<>();
+    SpatialIndex index;
+    void prepareIndex(){index=new SpatialIndex(this);}
     double minX=Double.POSITIVE_INFINITY,minY=Double.POSITIVE_INFINITY,
            maxX=Double.NEGATIVE_INFINITY,maxY=Double.NEGATIVE_INFINITY;
     int unit=0; int unitOverride=-1; int inserts=0, unsupported=0;
@@ -184,8 +188,7 @@ final class Dxf {
   }
   static String cleanText(String raw) {
     if(raw==null)return "";
-    Pattern escape=Pattern.compile("\\\\U\\+([0-9A-Fa-f]{4,8})");
-    Matcher matcher=escape.matcher(raw);
+    Matcher matcher=UNICODE_ESCAPE.matcher(raw);
     StringBuffer out=new StringBuffer();
     while(matcher.find()){
       String replacement="";
@@ -201,50 +204,103 @@ final class Dxf {
     return value.replace("\\L","").replace("\\l","").replace("\\O","").replace("\\o","")
       .replace("{","").replace("}","");
   }
+
   static Drawing parse(byte[] bytes)throws IOException {
-    if(bytes.length>192*1024*1024)throw new IOException("변환된 도면이 너무 큽니다.");
+    if(bytes.length>192*1024*1024)throw new IOException("도면 데이터가 너무 큽니다.");
+    try(BufferedReader reader=new BufferedReader(new InputStreamReader(
+        new ByteArrayInputStream(bytes),sourceCharset(bytes)),65536)){
+      return parseReader(reader);
+    }
+  }
+  // Stream the DXF converted from DWG, rather than copying the entire DXF into Java heap.
+  static Drawing parse(File file)throws IOException {
+    if(file.length()>220L*1024*1024)throw new IOException("변환된 도면 데이터가 너무 큽니다.");
+    byte[] header=new byte[(int)Math.min(file.length(),128*1024)];
+    int got=0;
+    try(FileInputStream input=new FileInputStream(file)){
+      while(got<header.length){
+        int n=input.read(header,got,header.length-got);
+        if(n<0)break;
+        got+=n;
+      }
+    }
+    Charset charset=sourceCharset(Arrays.copyOf(header,got));
+    try(BufferedReader reader=new BufferedReader(new InputStreamReader(
+        new FileInputStream(file),charset),65536)){
+      return parseReader(reader);
+    }
+  }
+  static boolean retain(int key) {
+    switch(key){
+      case 1: case 2: case 3: case 8: case 10: case 11:
+      case 20: case 21: case 40: case 41: case 42:
+      case 44: case 45: case 50: case 51: case 70:
+      case 71: case 72: case 73: case 90:return true;
+      default:return false;
+    }
+  }
+  static Drawing parseReader(BufferedReader reader)throws IOException {
     Drawing d=new Drawing();
     Map<String,Block> blocks=new HashMap<>();
-    ArrayList<Entity> model=new ArrayList<>();
-    BufferedReader reader=new BufferedReader(new InputStreamReader(
-      new ByteArrayInputStream(bytes),sourceCharset(bytes)),65536);
-    String section=""; boolean sectionPending=false, unitPending=false;
-    Entity active=null;Block currentBlock=null;int groups=0;
-    Pair p;
-    while((p=next(reader))!=null){
-      if(++groups>12000000)throw new IOException("DXF 요소가 너무 많습니다.");
-      if(p.key==0){
+    String section="";
+    boolean sectionPending=false,unitPending=false;
+    Entity active=null,modelPolyline=null;
+    Block currentBlock=null;
+    ArrayList<double[]> vertices=new ArrayList<>();
+    int groups=0;
+    Pair pair;
+    while((pair=next(reader))!=null){
+      if(++groups>12000000)throw new IOException("DXF 데이터가 너무 큽니다.");
+      if(pair.key==0){
         if(active!=null){
           if(section.equals("BLOCKS")&&active.type.equals("BLOCK"))currentBlock=new Block(active);
-          else if(section.equals("BLOCKS")&&active.type.equals("ENDBLK")) {
+          else if(section.equals("BLOCKS")&&active.type.equals("ENDBLK")){
             if(currentBlock!=null&&!currentBlock.name.isEmpty())
               blocks.put(currentBlock.name.toUpperCase(Locale.ROOT),currentBlock);
             currentBlock=null;
-          }else if(section.equals("BLOCKS")&&currentBlock!=null)currentBlock.entries.add(active);
-          else if(section.equals("ENTITIES"))model.add(active);
+          }else if(section.equals("BLOCKS")&&currentBlock!=null){
+            currentBlock.entries.add(active);
+          }else if(section.equals("ENTITIES")){
+            if(active.type.equals("POLYLINE")){
+              modelPolyline=active;vertices.clear();
+            }else if(active.type.equals("VERTEX")&&modelPolyline!=null){
+              vertices.add(new double[]{active.num(10,0),active.num(20,0),active.num(42,0)});
+            }else if(active.type.equals("SEQEND")&&modelPolyline!=null){
+              Entity poly=new Entity("LWPOLYLINE");
+              for(double[] point:vertices){
+                poly.vals.add(new Pair(10,Double.toString(point[0])));
+                poly.vals.add(new Pair(20,Double.toString(point[1])));
+                if(point[2]!=0)poly.vals.add(new Pair(42,Double.toString(point[2])));
+              }
+              poly.vals.add(new Pair(8,modelPolyline.layer()));
+              poly.vals.add(new Pair(70,Integer.toString(modelPolyline.integer(70,0)&1)));
+              flatten(d,Collections.singletonList(poly),blocks,Transform.identity(),"0",0,new HashSet<String>());
+              modelPolyline=null;vertices.clear();
+            }else if(!active.type.equals("VERTEX")){
+              flatten(d,Collections.singletonList(active),blocks,Transform.identity(),"0",0,new HashSet<String>());
+            }
+          }
           active=null;
         }
-        switch(p.value){
-          case "SECTION":sectionPending=true;section="";break;
-          case "ENDSEC":section="";sectionPending=false;break;
-          case "EOF":section="";break;
-          default:
-            if(section.equals("ENTITIES")||section.equals("BLOCKS"))active=new Entity(p.value);
+        if(pair.value.equals("SECTION")){sectionPending=true;section="";}
+        else if(pair.value.equals("ENDSEC")){section="";sectionPending=false;}
+        else if(pair.value.equals("EOF"))section="";
+        else if(section.equals("ENTITIES")||section.equals("BLOCKS"))active=new Entity(pair.value);
+      }else if(sectionPending&&pair.key==2){
+        section=pair.value;sectionPending=false;
+      }else{
+        if(pair.key==9)unitPending=pair.value.equals("$INSUNITS");
+        else if(unitPending&&pair.key==70){
+          try{d.unit=Integer.parseInt(pair.value);}catch(Exception ignored){}
+          unitPending=false;
         }
-      }else if(sectionPending&&p.key==2){section=p.value;sectionPending=false;}
-      else{
-        if(p.key==9)unitPending=p.value.equals("$INSUNITS");
-        else if(unitPending&&p.key==70){try{d.unit=Integer.parseInt(p.value);}catch(Exception ignored){}unitPending=false;}
-        if(active!=null)active.vals.add(p);
+        if(active!=null&&retain(pair.key))active.vals.add(pair);
       }
     }
-    if(active!=null){
-      if(section.equals("ENTITIES"))model.add(active);
-      else if(section.equals("BLOCKS")&&currentBlock!=null)currentBlock.entries.add(active);
-    }
-    if(currentBlock!=null)blocks.put(currentBlock.name.toUpperCase(Locale.ROOT),currentBlock);
-    flatten(d,model,blocks,Transform.identity(),"0",0,new HashSet<String>());
-    if(d.lines.isEmpty()&&d.texts.isEmpty())throw new IOException("지원되는 도면 요소가 없습니다.");
+    if(active!=null&&section.equals("ENTITIES"))
+      flatten(d,Collections.singletonList(active),blocks,Transform.identity(),"0",0,new HashSet<String>());
+    if(d.lines.isEmpty()&&d.texts.isEmpty())throw new IOException("표시 가능한 선 또는 문자가 없습니다.");
+    d.prepareIndex();
     return d;
   }
   static String layer(Entity e,String inherited){
