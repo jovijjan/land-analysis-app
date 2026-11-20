@@ -38,6 +38,18 @@ public class DxfSmokeTest {
     require(d.texts.stream().anyMatch(t->t.text.contains("측량")),"multiline MTEXT");
     require(d.texts.stream().anyMatch(t->t.text.contains("지적 도면")),"Korean TEXT");
     require(d.area(50).contains("50.000 m²"),"area unit formatting");
+
+    // Verify streaming parse(File), and that a viewport query returns nearby line indices.
+    java.io.File temp=java.io.File.createTempFile("civilcad-stream-test",".dxf");
+    try {
+      java.nio.file.Files.write(temp.toPath(),DXF.toString().getBytes(StandardCharsets.UTF_8));
+      Dxf.Drawing streamed=Dxf.parse(temp);
+      require(streamed.lines.size()==4&&streamed.polygons.size()==1,"file-backed parser");
+      require(streamed.index!=null,"spatial index built");
+      require(streamed.index.query(95,195,105,210).size==4,"visible block lines");
+      require(streamed.index.query(96,201,98,205).size>=1,"partial tile intersection");
+    } finally { temp.delete(); }
+
     System.out.println("DXF smoke test PASS - block insert, text, MTEXT, ATTRIB, closed polygon and area");
   }
 }
