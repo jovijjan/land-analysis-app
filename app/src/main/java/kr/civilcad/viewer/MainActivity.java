@@ -14,14 +14,32 @@ import java.util.*;
 import java.util.concurrent.*;
 
 public class MainActivity extends Activity {
-  static { System.loadLibrary("civilcad_native"); }
-  public static native byte[] decodeDwg(byte[] bytes) throws IOException;
   static final int OPEN=101;
   static final int PAN=0, DISTANCE=1, CLOSED_AREA=2, POINT_AREA=3;
   TextView status; Viewer view;
   Button measureButton, closedButton, pointButton;
   String drawingName="";
   final ExecutorService worker=Executors.newSingleThreadExecutor();
+  final Handler handler=new Handler(Looper.getMainLooper());
+  String pendingDecodeJob=null;
+  final BroadcastReceiver decodeReceiver=new BroadcastReceiver(){
+    @Override public void onReceive(Context context,Intent intent){
+      String job=intent.getStringExtra("job");
+      if(job==null||!job.equals(pendingDecodeJob))return;
+      pendingDecodeJob=null;
+      String error=intent.getStringExtra("error");
+      if(error!=null){
+        status.setText("DWG 읽기 실패: "+error);
+        return;
+      }
+      String output=intent.getStringExtra("output");
+      if(output==null){status.setText("DWG 변환 결과가 없습니다.");return;}
+      File file=new File(output);
+      status.setText("도면 요소를 준비하는 중...");
+      worker.submit(()->parseAndShow(file,drawingName,true));
+    }
+  };
+
 
   int dp(float v){return (int)(v*getResources().getDisplayMetrics().density+.5f);}
   Button button(String title){
@@ -34,6 +52,7 @@ public class MainActivity extends Activity {
 
   @Override public void onCreate(Bundle state) {
     super.onCreate(state);
+    registerReceiver(decodeReceiver,new IntentFilter(DwgDecoderService.ACTION));
     LinearLayout root=new LinearLayout(this);
     root.setOrientation(LinearLayout.VERTICAL);
     root.setBackgroundColor(Color.rgb(14,21,31));
@@ -122,6 +141,7 @@ public class MainActivity extends Activity {
         dialog.dismiss();
       }).setNegativeButton("취소",null).show();
   }
+
   @Override protected void onActivityResult(int req,int result,Intent data){
     super.onActivityResult(req,result,data);
     if(req!=OPEN||result!=RESULT_OK||data==null)return;
@@ -130,35 +150,93 @@ public class MainActivity extends Activity {
     try(Cursor c=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){
       if(c!=null&&c.moveToFirst())fileName=c.getString(0);
     }catch(Exception ignored){}
-    final String name=fileName;status.setText("도면을 읽는 중: "+name);
+    final String name=fileName;
+    drawingName=name;
+    pendingDecodeJob=null;
+    status.setText("파일 확인 중: "+name);
     worker.submit(()->{
+      File input=null,output=null;
       try{
-        byte[] bytes;
+        input=File.createTempFile("civilcad_input_",".cad",getCacheDir());
         try(InputStream in=getContentResolver().openInputStream(uri);
-            ByteArrayOutputStream out=new ByteArrayOutputStream()){
-          if(in==null)throw new IOException("파일을 읽을 수 없습니다.");
-          byte[] buffer=new byte[32768];int n;
+            OutputStream out=new BufferedOutputStream(new FileOutputStream(input),65536)){
+          if(in==null)throw new IOException("도면 파일을 열 수 없습니다.");
+          byte[] buffer=new byte[65536];int n;long total=0;
           while((n=in.read(buffer))!=-1){
-            if(out.size()+n>64*1024*1024)throw new IOException("현재 64MB 이하 도면만 지원합니다.");
+            total+=n;
+            if(total>64L*1024*1024)throw new IOException("64MB 이하 DWG 파일만 지원합니다.");
             out.write(buffer,0,n);
           }
-          bytes=out.toByteArray();
         }
-        boolean dwg=bytes.length>6&&bytes[0]=='A'&&bytes[1]=='C'&&bytes[2]=='1'&&bytes[3]=='0';
+        boolean dwg=false;
+        try(InputStream header=new FileInputStream(input)){
+          byte[] magic=new byte[6];
+          if(header.read(magic)==6){
+            dwg=magic[0]=='A'&&magic[1]=='C'&&magic[2]=='1'&&magic[3]=='0';
+          }
+        }
         if(!dwg&&!name.toLowerCase(Locale.ROOT).endsWith(".dxf"))
-          throw new IOException("DWG 또는 DXF만 지원합니다.");
-        Dxf.Drawing parsed=Dxf.parse(dwg?decodeDwg(bytes):bytes);
-        runOnUiThread(()->{
-          drawingName=name;view.setDrawing(parsed);view.mode=PAN;updateToolText();
-          status.setText(name+" · 선 "+parsed.lines.size()+" · 문자 "+parsed.texts.size()
-            +" · 블록삽입 "+parsed.inserts+" · 면적객체 "+parsed.polygons.size()
-            +" · "+parsed.units());
-        });
-      }catch(Throwable t){runOnUiThread(()->status.setText("도면 열기 실패: "+t.getMessage()));}
+          throw new IOException("DWG 또는 DXF 파일만 열 수 있습니다.");
+        if(dwg){
+          output=File.createTempFile("civilcad_output_",".dxf",getCacheDir());
+          final File inFile=input,outFile=output;
+          final String job=UUID.randomUUID().toString();
+          runOnUiThread(()->{
+            pendingDecodeJob=job;
+            status.setText("DWG를 안전하게 해석하는 중: "+name);
+            Intent service=new Intent(this,DwgDecoderService.class);
+            service.putExtra("job",job);
+            service.putExtra("input",inFile.getAbsolutePath());
+            service.putExtra("output",outFile.getAbsolutePath());
+            try{
+              if(startService(service)==null)throw new IOException("DWG 해석 서비스를 실행할 수 없습니다.");
+            }catch(Exception e){
+              pendingDecodeJob=null;
+              status.setText("DWG 해석 시작 실패: "+e.getMessage());
+              inFile.delete();outFile.delete();
+            }
+            handler.postDelayed(()->{
+              if(job.equals(pendingDecodeJob)){
+                pendingDecodeJob=null;
+                status.setText("DWG 읽기 시간이 초과됐습니다. 도면을 단순화하거나 용량을 확인해 주세요.");
+                inFile.delete();outFile.delete();
+              }
+            },120000);
+          });
+        }else{
+          parseAndShow(input,name,true);
+        }
+      }catch(Throwable error){
+        if(input!=null)input.delete();
+        if(output!=null)output.delete();
+        final String message=error.getMessage();
+        runOnUiThread(()->status.setText("도면 열기 실패: "+message));
+      }
     });
   }
-  @Override protected void onDestroy(){worker.shutdownNow();super.onDestroy();}
-
+  void parseAndShow(File input,String name,boolean deleteWhenDone){
+    try{
+      Dxf.Drawing parsed=Dxf.parse(input);
+      runOnUiThread(()->{
+        view.setDrawing(parsed);
+        view.mode=PAN;updateToolText();
+        status.setText(name+" · 선 "+parsed.lines.size()+" · 문자 "+parsed.texts.size()
+            +" · 블록 "+parsed.inserts+" · 면적 "+parsed.polygons.size()
+            +" · "+parsed.units());
+      });
+    }catch(Throwable error){
+      final String message=error.getMessage();
+      runOnUiThread(()->status.setText("도면 처리 실패: "+message));
+    }finally{
+      if(deleteWhenDone)input.delete();
+    }
+  }
+  @Override protected void onDestroy(){
+    unregisterReceiver(decodeReceiver);
+    pendingDecodeJob=null;
+    worker.shutdownNow();
+    super.onDestroy();
+  }
   final class Viewer extends View {
     static final class Batch { final float[] coords=new float[4096];int count; }
     final HashMap<Integer,Batch> batches=new HashMap<>();
