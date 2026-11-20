@@ -1,3 +1,3 @@
-# Land Analysis App
-
-Android CAD viewer experiments are developed on a separate branch; this main branch is reserved for the original land-analysis project.
+# CivilCAD Mobile (prototype)
+Android 64-bit DWG + DXF drawing viewer. Includes Android Java file chooser, pan/pinch zoom, 2-point coordinate distance and layer toggle. DWG decoding uses native acadrust 0.6.6 (MPL-2.0) compiled with Rust for arm64 and a JNI bridge. This is **not** the full CADCraft app and support for many types of complex DWG entities is missing. Prototype decoder runs in-process; do not open untrusted or malicious drawings. Do not consider a successful build proof that all DWG files work.
+This branch is isolated from the main land-analysis work. Github Actions workflow downloads SDK and NDK and attempts APK build. APK available in the actions artifacts only if build succeeds.
